@@ -1,65 +1,65 @@
 /*
- * =====================================================
- *  Plant Growth Monitor — ESP32-CAM WITH NTP
+ * ============================================================
+ * ESP32-CAM PLANT MONITOR — INTEGRATED DIAGNOSTIC BUILD
  *
- *  BOARD  : AI Thinker ESP32-CAM
- *  SENSOR : DHT22 on IO13
+ * Board: AI Thinker ESP32-CAM (ESP32-CAM-MB)
+ * Camera: VGA 640x480 JPEG, PSRAM, one frame buffer
+ * SD: Built-in microSD, one-bit mode
+ * DHT22: GPIO3 (UART RX; disconnect sensor if upload issues)
+ * L298N: IN1 GPIO12, IN2 GPIO13 (GPIO 4 left free to avoid flash LED)
  *
- *  SCHEDULE:
- *    Sensor log  → once every hour
- *    Photo       → on boot + daily at PHOTO_HOUR:PHOTO_MIN
+ * Files:
+ *   /log.csv
+ *   /errors.txt
+ *   /photo_YYYY-MM-DD_HH-MM.jpg
  *
- *  SD CARD:
- *    /log.csv
- *    /photo_YYYY-MM-DD_HH-MM.jpg
- * =====================================================
+ * Schedule:
+ *   Every hour at :00 — sensor logging
+ *   Daily at 12:15    — photo
+ *   Every hour at :30 — dip cycle
+ *
+ * Actuator:
+ *   Extend 20 seconds
+ *   Hold 30 seconds
+ *   Retract 20 seconds
+ * ============================================================
  */
 
-// ── Scheduled photo time ─────────────────────────────
-const int PHOTO_HOUR = 12;
-const int PHOTO_MIN  = 15;
-
-
-// ── Libraries ─────────────────────────────────────────
 #include "esp_camera.h"
 #include "FS.h"
 #include "SD_MMC.h"
 #include "DHT.h"
-#include "time.h"
 #include "WiFi.h"
+#include "time.h"
 #include <math.h>
 
-
-// ── WiFi ──────────────────────────────────────────────
+// ---------------- Wi-Fi ----------------
 #define WIFI_SSID    "WrongOne_Guest"
 #define WIFI_PASS    "Nope5768"
 
+// ---------------- Time -----------------
+#define NTP_SERVER "pool.ntp.org"
+#define TZ_INFO "PST8PDT,M3.2.0/2,M11.1.0/2"
 
-// ── Timezone ──────────────────────────────────────────
-// Pacific Time
-#define GMT_OFFSET_SEC    (-7 * 3600)
-#define DAYLIGHT_OFFSET   0
-#define NTP_SERVER        "pool.ntp.org"
+// ---------------- DHT22 ----------------
+#define DHT_PIN 3
+#define DHT_TYPE DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
 
+// ---------------- L298N ----------------
+#define MOTOR_IN1 12  // Safe pin, avoids onboard flash LED on GPIO 4
+#define MOTOR_IN2 13
 
-// ── DHT22 ─────────────────────────────────────────────
-#define DHTPIN  13
-#define DHTTYPE DHT22
+#define EXTEND_MS  20000UL
+#define HOLD_MS    30000UL
+#define RETRACT_MS 20000UL
 
-DHT dht(DHTPIN, DHTTYPE);
-
-
-// ── LED ───────────────────────────────────────────────
-#define LED_PIN 4
-
-
-// ── Camera pins (AI Thinker ESP32-CAM) ────────────────
+// ---------------- Camera pins -----------
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
 #define SIOC_GPIO_NUM     27
-
 #define Y9_GPIO_NUM       35
 #define Y8_GPIO_NUM       34
 #define Y7_GPIO_NUM       39
@@ -68,597 +68,368 @@ DHT dht(DHTPIN, DHTTYPE);
 #define Y4_GPIO_NUM       19
 #define Y3_GPIO_NUM       18
 #define Y2_GPIO_NUM        5
-
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-
-// ── Status variables ──────────────────────────────────
-unsigned long photoCount = 0;
-
+// ---------------- State ----------------
 bool sdReady = false;
-bool camReady = false;
-bool ntpSynced = false;
+bool cameraReady = false;
+bool wifiReady = false;
+bool timeReady = false;
 
-
-// ── Scheduler tracking ────────────────────────────────
 int lastLoggedHour = -1;
-int lastPhotoDay   = -1;
+int lastLoggedDay = -1;
+int lastPhotoDay = -1;
+int lastDipHour = -1;
+int lastDipDay = -1;
 
-
-// ── Dew point calculation ─────────────────────────────
-float dewPoint(float tempC, float humidity) {
-
-  float a = 17.271f;
-  float b = 237.7f;
-
-  float gamma =
-    ((a * tempC) / (b + tempC)) +
-    log(humidity / 100.0f);
-
-  return (b * gamma) / (a - gamma);
+// ---------------- Watchdog Helper ------
+void delayWithWDT(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    delay(100); // Feeds the task watchdog timer
+  }
 }
 
-
-// ── Get time ──────────────────────────────────────────
-bool getTime(struct tm &timeinfo) {
-
-  if (!getLocalTime(&timeinfo))
-    return false;
-
-  return true;
+// ---------------- Clock ----------------
+bool readClock(struct tm &t) {
+  return getLocalTime(&t, 1000);
 }
 
-
-// ── Timestamp string ──────────────────────────────────
 String timestamp() {
-
-  struct tm timeinfo;
-
-  if (!getTime(timeinfo))
-    return "NO_TIME";
+  struct tm t;
+  if (!readClock(t)) return "NO_TIME";
 
   char buf[24];
-
-  strftime(buf,
-           sizeof(buf),
-           "%Y-%m-%d %H:%M:%S",
-           &timeinfo);
-
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
   return String(buf);
 }
 
+// ---------------- Error logging --------
+void logError(const String &message) {
+  String ts = timestamp();
+  Serial.printf("[ERROR] %s | %s\n", ts.c_str(), message.c_str());
 
-// ── WiFi + NTP setup ──────────────────────────────────
-void initWiFi() {
-
-  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  int tries = 0;
-
-  while (WiFi.status() != WL_CONNECTED && tries++ < 20) {
-
-    delay(500);
-    Serial.print(".");
+  if (!sdReady) {
+    Serial.println("[ERROR] SD unavailable; error not saved");
+    return;
   }
 
-
-  if (WiFi.status() == WL_CONNECTED) {
-
-    Serial.println(" Connected");
-
-    configTime(
-      GMT_OFFSET_SEC,
-      DAYLIGHT_OFFSET,
-      NTP_SERVER
-    );
-
-
-    struct tm timeinfo;
-
-    int attempts = 0;
-
-    while (!getLocalTime(&timeinfo) && attempts++ < 10) {
-
-      Serial.println("[NTP] Waiting...");
-      delay(1000);
-    }
-
-
-    if (getLocalTime(&timeinfo)) {
-
-      char buf[32];
-
-      strftime(
-        buf,
-        sizeof(buf),
-        "%Y-%m-%d %H:%M:%S",
-        &timeinfo
-      );
-
-      Serial.printf("[NTP] Synced: %s\n", buf);
-
-      ntpSynced = true;
-
-
-      digitalWrite(LED_PIN, HIGH);
-      delay(300);
-      digitalWrite(LED_PIN, LOW);
-
-    } else {
-
-      Serial.println("[NTP] FAILED");
-    }
-
-  } else {
-
-    Serial.println("\n[WiFi] FAILED");
-
-    for (int i = 0; i < 5; i++) {
-
-      digitalWrite(LED_PIN, HIGH);
-      delay(300);
-
-      digitalWrite(LED_PIN, LOW);
-      delay(300);
-    }
+  File f = SD_MMC.open("/errors.txt", FILE_APPEND);
+  if (!f) {
+    Serial.println("[ERROR] Could not open /errors.txt");
+    return;
   }
+
+  f.printf("%s, %s\n", ts.c_str(), message.c_str());
+  f.close();
 }
 
-// ── Camera init ───────────────────────────────────────
+// ---------------- Motor -----------------
+void stopMotor() {
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+}
+
+void extendActuator() {
+  Serial.println("[MOTOR] Extend START");
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, HIGH);
+  delayWithWDT(EXTEND_MS);
+  stopMotor();
+  Serial.println("[MOTOR] Extend COMPLETE");
+}
+
+void retractActuator() {
+  Serial.println("[MOTOR] Retract START");
+  digitalWrite(MOTOR_IN1, HIGH);
+  digitalWrite(MOTOR_IN2, LOW);
+  delayWithWDT(RETRACT_MS);
+  stopMotor();
+  Serial.println("[MOTOR] Retract COMPLETE");
+}
+
+void dipCycle() {
+  Serial.printf("[DIP] START at %s\n", timestamp().c_str());
+  extendActuator();
+  Serial.println("[DIP] Holding for 30 seconds");
+  delayWithWDT(HOLD_MS);
+  retractActuator();
+  Serial.printf("[DIP] COMPLETE at %s\n", timestamp().c_str());
+}
+
+// ---------------- Dew point -------------
+float dewPoint(float tempC, float humidity) {
+  if (humidity <= 0.0f || humidity > 100.0f) {
+    return NAN;
+  }
+  const float a = 17.271f;
+  const float b = 237.7f;
+  float gamma = (a * tempC) / (b + tempC) + logf(humidity / 100.0f);
+  return (b * gamma) / (a - gamma);
+}
+
+// ---------------- Camera ----------------
 bool initCamera() {
-
-  camera_config_t config;
-
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href  = HREF_GPIO_NUM;
-
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-
-  config.pin_pwdn  = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-  config.xclk_freq_hz = 20000000;
-
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  config.frame_size = FRAMESIZE_UXGA;
-  config.jpeg_quality = 10;
-  config.fb_count = 1;
-
-
-  if (esp_camera_init(&config) != ESP_OK) {
-
-    Serial.println("[CAM] Init FAILED");
+  Serial.println("[CAM] Initializing camera");
+  if (!psramFound()) {
+    Serial.println("[CAM] PSRAM missing");
     return false;
   }
 
+  camera_config_t c = {};
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer = LEDC_TIMER_0;
+  c.pin_d0 = Y2_GPIO_NUM;
+  c.pin_d1 = Y3_GPIO_NUM;
+  c.pin_d2 = Y4_GPIO_NUM;
+  c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM;
+  c.pin_d5 = Y7_GPIO_NUM;
+  c.pin_d6 = Y8_GPIO_NUM;
+  c.pin_d7 = Y9_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM;
+  c.pin_pclk = PCLK_GPIO_NUM;
+  c.pin_vsync = VSYNC_GPIO_NUM;
+  c.pin_href = HREF_GPIO_NUM;
+  c.pin_sccb_sda = SIOD_GPIO_NUM;
+  c.pin_sccb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn = PWDN_GPIO_NUM;
+  c.pin_reset = RESET_GPIO_NUM;
+  c.xclk_freq_hz = 10000000;
+  c.pixel_format = PIXFORMAT_JPEG;
+  c.frame_size = FRAMESIZE_VGA;
+  c.jpeg_quality = 15;
+  c.fb_count = 1;
+  c.fb_location = CAMERA_FB_IN_PSRAM;
+  c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  Serial.println("[CAM] Ready");
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] INIT FAILED: 0x%x\n", err);
+    return false;
+  }
+
+  Serial.println("[CAM] VGA initialization successful");
   return true;
 }
 
-
-// ── SD init ───────────────────────────────────────────
+// ---------------- SD card ---------------
 bool initSD() {
-
+  Serial.println("[SD] Mounting built-in card, one-bit mode");
   if (!SD_MMC.begin("/sdcard", true)) {
-
-    Serial.println("[SD] Mount FAILED");
+    Serial.println("[SD] MOUNT FAILED");
     return false;
   }
-
 
   if (SD_MMC.cardType() == CARD_NONE) {
-
-    Serial.println("[SD] No card");
+    Serial.println("[SD] NO CARD");
+    SD_MMC.end();
     return false;
   }
 
-
-  Serial.println("[SD] Ready");
-
-
   if (!SD_MMC.exists("/log.csv")) {
-
     File f = SD_MMC.open("/log.csv", FILE_WRITE);
-
     if (f) {
-
-      f.println(
-        "timestamp,temperature_c,humidity_pct,heat_index_c,dew_point_c"
-      );
-
+      f.println("timestamp,temperature_c,humidity_pct,heat_index_c,dew_point_c");
       f.close();
     }
   }
 
+  if (!SD_MMC.exists("/errors.txt")) {
+    File f = SD_MMC.open("/errors.txt", FILE_WRITE);
+    if (f) {
+      f.println("Plant monitor error log");
+      f.close();
+    }
+  }
+
+  Serial.println("[SD] Mount and file checks successful");
   return true;
 }
 
+// ---------------- Wi-Fi and NTP ---------
+void initWiFi() {
+  Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-// ── Find last photo number ────────────────────────────
-unsigned long getLastPhotoCount() {
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    ++tries;
+  }
+  Serial.println();
 
-  unsigned long highest = 0;
-
-  File root = SD_MMC.open("/");
-
-
-  while (true) {
-
-    File entry = root.openNextFile();
-
-    if (!entry)
-      break;
-
-
-    String name = String(entry.name());
-
-
-    if (name.startsWith("photo_")) {
-
-      highest++;
-    }
-
-
-    entry.close();
+  if (WiFi.status() != WL_CONNECTED) {
+    logError("WIFI CONNECTION FAILED");
+    return;
   }
 
+  wifiReady = true;
+  Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
 
-  root.close();
+  configTzTime(TZ_INFO, NTP_SERVER);
+  Serial.println("[NTP] Waiting for synchronization");
 
-  return highest;
+  struct tm t;
+  for (int i = 0; i < 20; ++i) {
+    if (readClock(t)) {
+      timeReady = true;
+      Serial.printf("[NTP] Synced: %s\n", timestamp().c_str());
+      return;
+    }
+    delay(1000);
+  }
+
+  logError("NTP SYNC FAILED");
 }
 
+// ---------------- Photo ----------------
+bool takePhoto() {
+  if (!cameraReady || !sdReady) return false;
 
-// ── Sensor logging ────────────────────────────────────
+  camera_fb_t *fb = nullptr;
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    delay(300);
+  }
+
+  if (!fb) {
+    logError("CAMERA CAPTURE FAILED");
+    return false;
+  }
+
+  char path[48];
+  struct tm t;
+  if (readClock(t)) {
+    strftime(path, sizeof(path), "/photo_%Y-%m-%d_%H-%M.jpg", &t);
+  } else {
+    snprintf(path, sizeof(path), "/photo_notime.jpg");
+  }
+
+  bool saved = false;
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (f) {
+    size_t written = f.write(fb->buf, fb->len);
+    f.close();
+    if (written == fb->len) {
+      saved = true;
+      Serial.printf("[CAM] PHOTO SAVED: %s\n", path);
+    }
+  }
+
+  esp_camera_fb_return(fb);
+  return saved;
+}
+
+// ---------------- Sensor logging --------
 void logSensor() {
-
   float h = dht.readHumidity();
   float t = dht.readTemperature();
 
-
   if (isnan(h) || isnan(t)) {
-
-    Serial.println("[DHT] FAILED");
+    logError("DHT22 READ FAILED");
     return;
   }
-
 
   float hi = dht.computeHeatIndex(t, h, false);
-
   float dp = dewPoint(t, h);
 
-
-  Serial.printf(
-    "[DHT] %.1f C  %.1f %%  HI %.1f  DP %.1f\n",
-    t, h, hi, dp
-  );
-
-
-  if (!sdReady)
-    return;
-
+  if (!sdReady) return;
 
   File f = SD_MMC.open("/log.csv", FILE_APPEND);
-
-
-  if (!f)
-    return;
-
-
-  f.printf(
-    "%s,%.2f,%.2f,%.2f,%.2f\n",
-    timestamp().c_str(),
-    t,
-    h,
-    hi,
-    dp
-  );
-
-
-  f.close();
-
-  Serial.println("[CSV] Logged");
-}
-
-
-// ── Photo capture ─────────────────────────────────────
-void takePhoto() {
-
-  if (!camReady || !sdReady)
-    return;
-
-
-  digitalWrite(LED_PIN, HIGH);
-  delay(150);
-
-
-  camera_fb_t *fb = esp_camera_fb_get();
-
-
-  digitalWrite(LED_PIN, LOW);
-
-
-  if (!fb) {
-
-    Serial.println("[CAM] Capture FAILED");
-    return;
-  }
-
-
-  char path[64];
-
-  struct tm timeinfo;
-
-
-  if (getTime(timeinfo)) {
-
-    strftime(
-      path,
-      sizeof(path),
-      "/photo_%Y-%m-%d_%H-%M.jpg",
-      &timeinfo
-    );
-
-  } else {
-
-    snprintf(
-      path,
-      sizeof(path),
-      "/photo_%lu.jpg",
-      photoCount++
-    );
-  }
-
-
-  File f = SD_MMC.open(path, FILE_WRITE);
-
-
   if (f) {
-
-    f.write(fb->buf, fb->len);
+    f.printf("%s,%.2f,%.2f,%.2f,%.2f\n", timestamp().c_str(), t, h, hi, dp);
     f.close();
-
-    Serial.printf(
-      "[CAM] Saved %s\n",
-      path
-    );
-
-  } else {
-
-    Serial.println("[CAM] Save FAILED");
+    Serial.println("[CSV] Sensor record saved");
   }
-
-
-  esp_camera_fb_return(fb);
 }
 
-
-// ── Helper: seconds until next HH:MM ──────────────────
-long secondsUntil(int targetHour, int targetMin) {
-
-  struct tm timeinfo;
-
-
-  if (!getTime(timeinfo))
-    return 60;
-
-
-  int nowSec =
-    timeinfo.tm_hour * 3600 +
-    timeinfo.tm_min  * 60 +
-    timeinfo.tm_sec;
-
-
-  int targetSec =
-    targetHour * 3600 +
-    targetMin  * 60;
-
-
-  long diff = targetSec - nowSec;
-
-
-  if (diff <= 0)
-    diff += 86400;
-
-
-  return diff;
-}
-
-
-// ── Setup ─────────────────────────────────────────────
+// ---------------- Setup -----------------
 void setup() {
-
   Serial.begin(115200);
-
   delay(2000);
 
+  Serial.println("\n========================================");
+  Serial.println("PLANT MONITOR — REBUILT BUILD");
+  Serial.println("========================================");
 
-  Serial.println("\n=== PLANT MONITOR START ===");
-
-
-  pinMode(LED_PIN, OUTPUT);
-
-  digitalWrite(LED_PIN, LOW);
-
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  stopMotor();
 
   dht.begin();
-
-
   delay(2000);
 
+  Serial.println("[BOOT] Step 1: Initial actuator retraction");
+  retractActuator();
 
+  Serial.println("[BOOT] Step 2: Camera initialization");
+  cameraReady = initCamera();
+
+  Serial.println("[BOOT] Step 3: SD initialization");
+  sdReady = initSD();
+
+  Serial.println("[BOOT] Step 4: Wi-Fi and NTP");
   initWiFi();
 
+  Serial.println("[BOOT] Step 5: Boot photo");
+  if (cameraReady && sdReady) takePhoto();
 
-  camReady = initCamera();
+  Serial.println("[BOOT] Step 6: Initial dip cycle");
+  dipCycle();
 
-  sdReady  = initSD();
+  struct tm t;
+  if (readClock(t)) {
+    lastLoggedHour = t.tm_hour;
+    lastLoggedDay = t.tm_yday;
+    lastPhotoDay = t.tm_yday;
 
-
-  if (sdReady)
-    photoCount = getLastPhotoCount();
-
-
-
-  // Boot actions
-  Serial.println("\n--- Boot reading ---");
-
-  logSensor();
-
-  takePhoto();
-
-
-
-  // Prevent duplicate hourly log
-  struct tm timeinfo;
-
-  if (getTime(timeinfo)) {
-
-    lastLoggedHour = timeinfo.tm_hour;
+    int minsToNextDip = 30 - (t.tm_min % 30);
+    if (minsToNextDip <= 5) {
+      lastDipHour = t.tm_hour;
+      lastDipDay = t.tm_yday;
+      Serial.println("[BOOT] Skipping dip; too close to :30");
+    }
   }
 
-
-  Serial.println("[OK] Running");
+  Serial.println("[BOOT] Startup complete");
+  Serial.println("========================================");
 }
 
-
-
-// ── Main loop ─────────────────────────────────────────
+// ---------------- Main loop -------------
 void loop() {
-
-
-  struct tm timeinfo;
-
-
-  if (!getTime(timeinfo)) {
-
-    delay(60000);
+  struct tm t;
+  if (!readClock(t)) {
+    delay(1000);
     return;
   }
 
+  timeReady = true;
+  int hourNow = t.tm_hour;
+  int minuteNow = t.tm_min;
+  int dayNow = t.tm_yday;
 
-  int currentHour = timeinfo.tm_hour;
-  int currentMin  = timeinfo.tm_min;
-  int currentDay  = timeinfo.tm_mday;
-
-
-
-  // Hourly sensor log
-  if (currentHour != lastLoggedHour) {
-
-    lastLoggedHour = currentHour;
-
-    Serial.printf(
-      "\n--- %s ---\n",
-      timestamp().c_str()
-    );
-
+  if (minuteNow == 0 && (hourNow != lastLoggedHour || dayNow != lastLoggedDay)) {
+    lastLoggedHour = hourNow;
+    lastLoggedDay = dayNow;
     logSensor();
   }
 
-
-
-  // Scheduled daily photo
-  if (currentDay != lastPhotoDay &&
-      (currentHour > PHOTO_HOUR ||
-      (currentHour == PHOTO_HOUR &&
-       currentMin >= PHOTO_MIN))) {
-
-
-    lastPhotoDay = currentDay;
-
-
-    Serial.printf(
-      "\n--- Scheduled photo %s ---\n",
-      timestamp().c_str()
-    );
-
-
+  if (hourNow == 12 && minuteNow == 15 && dayNow != lastPhotoDay) {
+    lastPhotoDay = dayNow;
     takePhoto();
   }
 
-
-
-  // Decide next wake time
-
-  long secsToLog =
-    secondsUntil((currentHour + 1) % 24, 0);
-
-
-  long secsToPhoto;
-
-
-  if (currentDay == lastPhotoDay) {
-
-    secsToPhoto =
-      secondsUntil(PHOTO_HOUR, PHOTO_MIN);
-
+  if (minuteNow == 30 && (hourNow != lastDipHour || dayNow != lastDipDay)) {
+    lastDipHour = hourNow;
+    lastDipDay = dayNow;
+    dipCycle();
   }
 
-  else if (currentHour < PHOTO_HOUR ||
-          (currentHour == PHOTO_HOUR &&
-           currentMin < PHOTO_MIN)) {
-
-
-    secsToPhoto =
-      secondsUntil(PHOTO_HOUR, PHOTO_MIN);
-
-  }
-
-  else {
-
-    secsToPhoto = 5;
-  }
-
-
-
-  long sleepSecs =
-    min(secsToLog, secsToPhoto) - 5;
-
-
-  if (sleepSecs < 1)
-    sleepSecs = 1;
-
-
-
-  Serial.printf(
-    "[TIME] %02d:%02d:%02d | Log %ld sec | Photo %ld sec\n",
-    currentHour,
-    currentMin,
-    timeinfo.tm_sec,
-    secsToLog,
-    secsToPhoto
-  );
-
-
-  Serial.printf(
-    "[SLEEP] %ld min %ld sec\n",
-    sleepSecs / 60,
-    sleepSecs % 60
-  );
-
-
-  delay(sleepSecs * 1000UL);
+  delay(500);
 }
